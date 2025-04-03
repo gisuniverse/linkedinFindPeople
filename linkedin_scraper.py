@@ -1,299 +1,184 @@
-import asyncio
-from playwright.async_api import async_playwright
-import os
 from dotenv import load_dotenv
 from datetime import datetime
-from sqlalchemy import select, func
-from models import init_db, Connection, ScrapingHistory
+import random
+import time
+from typing import List, Dict
+import json
+from persistent_browser import PersistentBrowser
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
+# Load environment variables
 load_dotenv(override=True)
 
-Session = init_db()
-
-def save_connections_to_db(connections_data):
-    session = Session()
-    try:
-        for conn_data in connections_data:
-            existing = session.query(Connection).filter_by(
-                profile_url=conn_data['profile_url']
-            ).first()
+class Scrapper(PersistentBrowser):
+    def __init__(self, storage_state_path: str = "browser_state.json"):
+        super().__init__(storage_state_path)
+        self.base_url = "https://www.linkedin.com"
+        
+    def _random_delay(self, min_seconds: float = 2.0, max_seconds: float = 5.0):
+        """Add random delay to mimic human behavior"""
+        delay = random.uniform(min_seconds, max_seconds)
+        time.sleep(delay)
+        
+    def _human_scroll(self, page: Page, scroll_distance: int = 300):
+        """Scroll like a human with variable speed and pauses"""
+        current_position = 0
+        target_position = scroll_distance
+        
+        while current_position < target_position:
+            # Random scroll chunk (20-60 pixels)
+            scroll_chunk = random.randint(20, 60)
+            current_position = min(current_position + scroll_chunk, target_position)
             
-            if existing:
-                existing.name = conn_data['name']
-                existing.occupation = conn_data['occupation']
-            else:
-                new_connection = Connection(
-                    name=conn_data['name'],
-                    occupation=conn_data['occupation'],
-                    profile_url=conn_data['profile_url']
-                )
-                session.add(new_connection)
+            # Scroll with smooth behavior
+            page.evaluate(f"window.scrollTo({{top: {current_position}, behavior: 'smooth'}})")
+            
+            # Random micro-pause between scrolls (0.1-0.3 seconds)
+            time.sleep(random.uniform(0.1, 0.3))
+            
+        # Pause at the end of scroll
+        self._random_delay(1.0, 2.0)
         
-        scraping_record = ScrapingHistory(
-            connections_count=len(connections_data)
-        )
-        session.add(scraping_record)
+    def _ensure_valid_url(self, url: str) -> str:
+        """Ensure URL is properly formatted"""
+        if not url.startswith(('http://', 'https://')):
+            url = f"{self.base_url}{url if url.startswith('/') else f'/{url}'}"
+        return url
         
-        session.commit()
-        return True
-    
-    except Exception as e:
-        print(f"Error saving to database: {str(e)}")
-        session.rollback()
-        return False
-    
-    finally:
-        session.close()
-
-async def set_cookie_session(context):
-    try:
-        cookie_session = os.getenv('LINKEDIN_COOKIE_SESSION')
-        if not cookie_session:
-            raise ValueError("LINKEDIN_COOKIE_SESSION not found in .env file")
-        
-        await context.add_cookies([{
-            'name': 'li_at',
-            'value': cookie_session,
-            'domain': '.linkedin.com',
-            'path': '/'
-        }])
-        return True
-    except Exception as e:
-        print(f"Error setting cookie session: {str(e)}")
-        return False
-
-def save_single_connection(connection_data):
-    session = Session()
-    try:
-        existing = session.query(Connection).filter_by(
-            profile_url=connection_data['profile_url']
-        ).first()
-        
-        if existing:
-            existing.name = connection_data['name']
-            existing.occupation = connection_data['occupation']
-            print(f"Updated existing connection: {connection_data['name']}")
-        else:
-            new_connection = Connection(
-                name=connection_data['name'],
-                occupation=connection_data['occupation'],
-                profile_url=connection_data['profile_url']
-            )
-            session.add(new_connection)
-            print(f"Saved new connection: {connection_data['name']}")
-        
-        session.commit()
-        return True
-    
-    except Exception as e:
-        print(f"Error saving connection {connection_data['name']}: {str(e)}")
-        session.rollback()
-        return False
-    
-    finally:
-        session.close()
-
-def record_scraping_session(total_connections):
-    session = Session()
-    try:
-        scraping_record = ScrapingHistory(
-            connections_count=total_connections
-        )
-        session.add(scraping_record)
-        session.commit()
-        return True
-    except Exception as e:
-        print(f"Error recording scraping session: {str(e)}")
-        session.rollback()
-        return False
-    finally:
-        session.close()
-
-async def get_connections(page):
-    print("Navigating to connections page...")
-    try:
-        await page.goto(
-            'https://www.linkedin.com/mynetwork/invite-connect/connections/',
-            wait_until='domcontentloaded',
-            timeout=60000
-        )
-    except Exception as e:
-        print(f"Navigation error: {str(e)}")
-        print("Trying to proceed anyway...")
-    
-    if 'login' in page.url:
-        raise Exception("Not logged in. Please check your cookie session value.")
-    
-    print("Waiting for page to load...")
-    try:
-        await page.wait_for_selector('body', timeout=10000)
-        await page.wait_for_timeout(5000)
-        
-        current_url = page.url
-        if 'connections' not in current_url:
-            print(f"Warning: Unexpected URL: {current_url}")
-    except Exception as e:
-        print(f"Initial loading error: {str(e)}")
-        print("Trying to proceed anyway...")
-    
-    connections = []
-    last_height = 0
-    scroll_attempts = 0
-    max_scroll_attempts = 100
-    total_saved = 0
-    failed_saves = 0
-    
-    while scroll_attempts < max_scroll_attempts:
-        print(f"\nScroll attempt {scroll_attempts + 1}/{max_scroll_attempts}")
-        
+    def _extract_connections_data(self, page: Page) -> List[Dict]:
+        """Extract connection data from the page"""
+        connections = []
         try:
-            for _ in range(3):
-                current_position = await page.evaluate('window.pageYOffset')
-                await page.evaluate('window.scrollBy(0, window.innerHeight)')
-                await page.wait_for_timeout(1000)
-                new_position = await page.evaluate('window.pageYOffset')
-                if new_position == current_position:
-                    print("Reached bottom of page (no scroll possible)")
-                    break
-            
-            await page.wait_for_timeout(2000)
-            
-            selectors = [
-                'div.scaffold-finite-scroll__content > div > div',
-                '.mn-connections-list__card',
-                '.mn-connection-card',
-                '[data-control-name="connection_card"]',
-                '.artdeco-list__item',
-                'li.mn-connection-card'
-            ]
-            
-            connection_elements = []
-            for selector in selectors:
-                try:
-                    elements = await page.query_selector_all(selector)
-                    if elements:
-                        print(f"Found {len(elements)} elements using selector: {selector}")
-                        connection_elements = elements
-                        break
-                except Exception as e:
-                    continue
-            
-            if not connection_elements:
-                print("No connection elements found with any selector")
-                await page.screenshot(path=f'debug_scroll_{scroll_attempts}.png')
-                continue
-            
-            new_connections_found = False
-            for element in connection_elements:
-                try:
-                    name = await element.query_selector('.mn-connection-card__name, .artdeco-entity-lockup__title, span[aria-hidden="true"]')
-                    name_text = await name.inner_text() if name else "N/A"
-                    
-                    occupation = await element.query_selector('.mn-connection-card__occupation, .artdeco-entity-lockup__subtitle, .entity-result__primary-subtitle')
-                    occupation_text = await occupation.inner_text() if occupation else "N/A"
-                    
-                    profile_link = await element.query_selector('a[href*="/in/"], a.app-aware-link, .entity-result__title-text > a')
-                    profile_url = await profile_link.get_attribute('href') if profile_link else "N/A"
-                    
-                    if profile_url != "N/A":
-                        profile_url = profile_url.split('?')[0]
-                    
-                    connection = {
-                        'name': name_text.strip(),
-                        'occupation': occupation_text.strip(),
-                        'profile_url': profile_url
-                    }
-                    
-                    if connection not in connections and connection['name'] != "N/A":
-                        connections.append(connection)
-                        if save_single_connection(connection):
-                            total_saved += 1
-                            new_connections_found = True
-                        else:
-                            failed_saves += 1
+            # Wait for the connections list to load
+            page.wait_for_selector('.search-results-container ul[role="list"]', timeout=10000)
+
+        except Exception as e:
+            print(f"Error in connection extraction: {e}")
+    
+        # Get all connection elements
+        connection_elements = page.query_selector_all('.search-results-container ul[role="list"] li')[:10]
+        
+        for element in connection_elements:
+            try:
+                name_elem = element.query_selector('.t-16 span[aria-hidden="true"]') 
+                location_elem = element.query_selector('div[class*="t-14 t-normal"]:not([class*="t-black"])')
+                profile_link_elem = element.query_selector('.linked-area a[href*="/in/"]')
+                title_elem = element.query_selector('div[class*="t-14 t-black t-normal"]')
                 
-                except Exception as e:
-                    print(f"Error processing connection element: {str(e)}")
-                    continue
+                connection = {
+                        'name': name_elem.inner_text().strip(),
+                        'title': title_elem.inner_text().strip(),
+                        'location': location_elem.inner_text().strip(),
+                        'profile_url': profile_link_elem.get_attribute('href').split('?')[0] ,
+                        'scraped_at': datetime.now().isoformat()
+                    }
+                
+                connections.append(connection)
             
-            if not new_connections_found:
-                print("No new connections found in this scroll")
-                no_new_connections_count += 1
-                if no_new_connections_count >= 5:
-                    print("\nNo new connections found in last 5 scrolls, assuming we reached the end")
-                    break
-            else:
-                no_new_connections_count = 0
-                print(f"\nProgress: {total_saved} connections saved successfully")
-                if failed_saves > 0:
-                    print(f"Failed saves: {failed_saves}")
-            
-            scroll_attempts += 1
-            await page.wait_for_timeout(1000)
-            
-        except Exception as e:
-            print(f"Error during scroll attempt {scroll_attempts}: {str(e)}")
-            await page.wait_for_timeout(2000)
-            continue
-    
-    print(f"\nFinished scrolling. Total connections saved: {total_saved}")
-    if failed_saves > 0:
-        print(f"Failed to save {failed_saves} connections")
-    
-    if total_saved > 0:
-        record_scraping_session(total_saved)
-    
-    return connections
+            except Exception as e:
+                print(f"Error extracting connection data: {e}")
+                continue
+        
 
-def print_stats():
-    session = Session()
-    try:
-        total_connections = session.query(Connection).count()
+        return connections
         
-        new_connections = session.query(Connection).filter(
-            Connection.first_seen >= datetime.now().replace(second=0, microsecond=0)
-        ).count()
+    def get_connections(self, profile_url: str) -> List[Dict]:
+        """
+        Get connections from a LinkedIn profile
         
-        last_scrapes = session.query(ScrapingHistory).order_by(
-            ScrapingHistory.scrape_date.desc()
-        ).limit(2).all()
+        Args:
+            profile_url (str): URL of the LinkedIn profile to scrape connections from
+            
+        Returns:
+            List[Dict]: List of connections with their details
+        """
         
-        print("\n=== Scraping Statistics ===")
-        print(f"Total connections in database: {total_connections}")
-        print(f"New connections added: {new_connections}")
-        
-        if len(last_scrapes) > 1:
-            prev_count = last_scrapes[1].connections_count
-            current_count = last_scrapes[0].connections_count
-            diff = current_count - prev_count
-            print(f"Change since last scrape: {diff:+d}")
-        
-        print("=========================\n")
-    
-    finally:
-        session.close()
-
-async def main():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context()
-        
-        if not await set_cookie_session(context):
-            print("Failed to set cookie session. Please check your .env file!")
-            return
-        
-        page = await context.new_page()
+        profile_url = self._ensure_valid_url(profile_url)
+        connections = []
         
         try:
-            connections = await get_connections(page)
-            print_stats()
-            
-        except Exception as e:
-            print(f"An error occurred: {str(e)}")
-        
-        finally:
-            await context.close()
-            await browser.close()
+            # Navigate to the profile page
+            self.page.goto(profile_url)
+            self._random_delay(3.0, 5.0)
 
+        except Exception as e:
+            print(f"Error during connection scraping: {e}")
+            # Save state in case of error
+            self.save_state()
+            
+        # Find and click the connections button
+        try:
+            connections_button = self.page.wait_for_selector('a[href*="connectionOf"]', timeout=5000)
+            if not connections_button:
+                raise PlaywrightTimeoutError("Could not find connections button - profile might be private or not connected")
+            
+        except PlaywrightTimeoutError:
+            print("Could not find connections button - profile might be private or not connected")
+            return []
+        
+
+        # Move mouse naturally to the button
+        connections_button.hover()
+        self._random_delay(0.5, 1.0)
+        connections_button.click()
+        
+        # Wait for connections page to load
+        self._random_delay(2.0, 4.0)
+        
+        self.human_like_behavior()
+
+        # Extract connections data
+        
+        connections = self._extract_connections_data(self.page)
+        
+        # Save the connections to a JSON file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"connections_{timestamp}.json"
+        with open(filename, 'w') as f:
+            json.dump(connections, f, indent=2)
+        
+        return connections
+
+    def human_like_behavior(self):
+        
+        # Initialize variables for infinite scroll
+        last_height = self.page.evaluate('document.body.scrollHeight')
+        all_loaded = False
+        scroll_attempts = 0
+        max_scroll_attempts = 20  # Limit scrolling to prevent infinite loops
+        
+
+        while not all_loaded and scroll_attempts < max_scroll_attempts:
+            # Scroll like a human
+            self._human_scroll(self.page, scroll_distance=random.randint(300, 500))
+            
+            # Wait for possible new content to load
+            self._random_delay(1.0, 2.0)
+            
+            # Check if we've reached the bottom
+            new_height = self.page.evaluate('document.body.scrollHeight')
+            if new_height == last_height:
+                scroll_attempts += 1
+                if scroll_attempts >= 3:  # If height hasn't changed for 3 attempts, assume all loaded
+                    all_loaded = True
+            else:
+                scroll_attempts = 0  # Reset counter if height changed
+                last_height = new_height
+                
+            # Save state periodically
+            if scroll_attempts % 5 == 0:
+                self.save_state()
+        
+
+# Example usage
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    scraper = Scrapper()
+    try:
+        page = scraper.start()
+        # Replace with actual profile URL
+        connections = scraper.get_connections("https://www.linkedin.com/in/bekim-alliu-183671243/")
+        print(f"Found {len(connections)} connections")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        scraper.close() 
