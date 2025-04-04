@@ -26,6 +26,7 @@ class Scrapper(PersistentBrowser):
         target_position = scroll_distance
         
         while current_position < target_position:
+            
             # Random scroll chunk (20-60 pixels)
             scroll_chunk = random.randint(20, 60)
             current_position = min(current_position + scroll_chunk, target_position)
